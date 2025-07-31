@@ -1,0 +1,10 @@
+chess\server\ClientHandler.class
+chess\server\ServerCommand.class
+chess\server\ChessServerMain.class
+chess\server\ServerBoard.class
+chess\server\ServerConfig.class
+chess\server\ServerCommand$Player.class
+chess\server\ServerChessLogic.class
+chess\server\ServerMessageBroadcaster.class
+chess\server\ChessServer.class
+chess\server\ServerCommand$CommandType.class

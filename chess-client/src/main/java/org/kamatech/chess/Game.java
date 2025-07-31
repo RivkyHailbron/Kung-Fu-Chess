@@ -1,0 +1,1834 @@
+package org.kamatech.chess;
+
+import javax.swing.*;
+import javax.swing.border.*;
+import java.awt.*;
+import org.kamatech.chess.api.*;
+import org.kamatech.chess.events.*;
+import org.kamatech.chess.listeners.*;
+import java.awt.event.KeyEvent;
+import java.io.*;
+import java.net.URL;
+import java.util.*;
+import javax.imageio.ImageIO;
+import java.util.List;
+
+/**
+ * Main game class that orchestrates all game components
+ * Manages board state, command processing, physics, and game flow
+ */
+public class Game {
+    private static final boolean DEBUG = false; // Set to true for debug output
+
+    private final Board board;
+    private final Graphics graphics;
+    private final Physics physics;
+    private final GameLogger logger;
+    private final Map<String, Piece> pieces;
+    private final IPieceFactory pieceFactory;
+    private final IGraphicsFactory graphicsFactory;
+    private final IPhysicsFactory physicsFactory;
+    private final JFrame frame;
+    private boolean running;
+    private long lastUpdateTime;
+    private final Set<Integer> pressedKeys;
+    private String selectedPieceWhite; // Selected piece for white player
+    private String selectedPieceBlack; // Selected piece for black player
+    private String hoveredPieceWhite; // Piece currently being hovered by white player
+    private String hoveredPieceBlack; // Piece currently being hovered by black player
+    // Cursor position tracking for board navigation
+    private int whiteCursorX = 0, whiteCursorY = 0; // White player cursor position
+    private int blackCursorX = 0, blackCursorY = 0; // Black player cursor position
+    private boolean whiteInMovementMode = false; // Whether white player is in movement mode
+    private boolean blackInMovementMode = false; // Whether black player is in movement mode
+    // Pending moves storage
+    private int whitePendingDx = 0;
+    private int whitePendingDy = 0;
+    private int blackPendingDx = 0;
+    private int blackPendingDy = 0;
+    // Visual position tracking for real-time feedback
+    private double whiteVisualX = -1, whiteVisualY = -1; // Visual position for white piece
+    private double blackVisualX = -1, blackVisualY = -1; // Visual position for black piece
+
+    // Background image
+    private java.awt.image.BufferedImage backgroundImage;
+
+    private void updateVisualPosition(Command.Player player) {
+        try {
+            if (player == Command.Player.WHITE && selectedPieceWhite != null) {
+                Piece piece = pieces.get(selectedPieceWhite);
+                if (piece != null) {
+                    whiteVisualX = piece.getX() + whitePendingDx;
+                    whiteVisualY = piece.getY() + whitePendingDy;
+                }
+            } else if (player == Command.Player.BLACK && selectedPieceBlack != null) {
+                Piece piece = pieces.get(selectedPieceBlack);
+                if (piece != null) {
+                    blackVisualX = piece.getX() + blackPendingDx;
+                    blackVisualY = piece.getY() + blackPendingDy;
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("Error updating visual position: " + e.getMessage());
+        }
+    }
+
+    private void initializeVisualPosition(Command.Player player) {
+        // Initialize visual position to match the current piece position
+        if (player == Command.Player.WHITE && selectedPieceWhite != null) {
+            Piece piece = pieces.get(selectedPieceWhite);
+            if (piece != null) {
+                whiteVisualX = piece.getX();
+                whiteVisualY = piece.getY();
+            }
+        } else if (player == Command.Player.BLACK && selectedPieceBlack != null) {
+            Piece piece = pieces.get(selectedPieceBlack);
+            if (piece != null) {
+                blackVisualX = piece.getX();
+                blackVisualY = piece.getY();
+            }
+        }
+    }
+
+    /**
+     * Update visual position after a piece has moved to its new position
+     */
+    private void updateVisualPositionAfterMove(Piece piece, double newX, double newY) {
+        String pieceId = getPieceIdFromPiece(piece);
+        
+        // Update visual position for the moved piece
+        if (pieceId.equals(selectedPieceWhite)) {
+            whiteVisualX = newX;
+            whiteVisualY = newY;
+            // Reset pending movement
+            whitePendingDx = 0;
+            whitePendingDy = 0;
+        } else if (pieceId.equals(selectedPieceBlack)) {
+            blackVisualX = newX;
+            blackVisualY = newY;
+            // Reset pending movement  
+            blackPendingDx = 0;
+            blackPendingDy = 0;
+        }
+    }
+
+    // Event system
+    private EventBus eventBus;
+    private MoveTableListener moveTableListener;
+    private AnimationListener animationListener;
+    private SoundPlayer soundPlayer;
+    private int moveCounter = 0;
+
+    private static final long UPDATE_INTERVAL_MS = 33; // ~30 FPS for slower updates
+
+    public Game(Board board, IPieceFactory pieceFactory, IGraphicsFactory graphicsFactory,
+            IPhysicsFactory physicsFactory) {
+        this.board = board;
+        this.pieces = new HashMap<>();
+        this.pieceFactory = pieceFactory;
+        this.graphicsFactory = graphicsFactory;
+        this.physicsFactory = physicsFactory;
+        this.graphics = graphicsFactory.createGraphics("", "");
+        this.physics = physicsFactory.createPhysics("", null);
+        this.logger = new GameLogger();
+        this.running = false;
+        this.lastUpdateTime = System.currentTimeMillis();
+        this.pressedKeys = new HashSet<>();
+        this.selectedPieceWhite = null;
+        this.selectedPieceBlack = null;
+        this.hoveredPieceWhite = null;
+        this.hoveredPieceBlack = null;
+
+        // Create EventBus and MoveTableListener
+        this.eventBus = new EventBus();
+        this.moveTableListener = new MoveTableListener();
+        this.eventBus.subscribe(PieceMovedEvent.class, moveTableListener);
+
+        // Create and register SoundPlayer
+        this.soundPlayer = new SoundPlayer();
+        this.eventBus.subscribe(SoundEvent.class, soundPlayer);
+
+        // Create and setup the window
+        this.frame = new JFrame("Chess Game");
+        this.frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        
+        // Set maximized window (not fullscreen) - user can still exit normally
+        this.frame.setExtendedState(JFrame.MAXIMIZED_BOTH);
+        
+        this.frame.setLocationRelativeTo(null);
+        this.frame.addKeyListener(new InputHandler(this));
+        this.frame.setFocusable(true);
+
+        // Create main panel with BorderLayout and background
+        JPanel mainPanel = new JPanel(new BorderLayout()) {
+            @Override
+            protected void paintComponent(java.awt.Graphics g) {
+                super.paintComponent(g);
+                Graphics2D g2d = (Graphics2D) g;
+
+                // Draw background image scaled to panel size
+                if (backgroundImage != null) {
+                    g2d.drawImage(backgroundImage, 0, 0, getWidth(), getHeight(), this);
+                }
+            }
+        };
+
+        // Create AnimationListener and subscribe to events
+        this.animationListener = new AnimationListener(frame, mainPanel);
+        // Subscribe to specific event types for animations
+        this.eventBus.subscribe(GameStartedEvent.class,
+                new org.kamatech.chess.events.EventListener<GameStartedEvent>() {
+                    @Override
+                    public void onEvent(GameStartedEvent event) {
+                        animationListener.onEvent(event);
+                    }
+                });
+        this.eventBus.subscribe(GameEndedEvent.class, new org.kamatech.chess.events.EventListener<GameEndedEvent>() {
+            @Override
+            public void onEvent(GameEndedEvent event) {
+                animationListener.onEvent(event);
+            }
+        });
+
+        // Create game board panel (center) - transparent to show background
+        JPanel gameBoardPanel = new JPanel() {
+            @Override
+            protected void paintComponent(java.awt.Graphics g) {
+                // Don't call super.paintComponent to keep transparency
+                Graphics2D g2d = (Graphics2D) g;
+
+                // Calculate responsive board size - use percentage of available space
+                int panelWidth = getWidth();
+                int panelHeight = getHeight();
+                
+                // Use 90% of the smaller dimension to ensure board fits nicely
+                int maxBoardSize = (int) (Math.min(panelWidth, panelHeight) * 0.9);
+                int boardSize = Math.max(400, maxBoardSize); // Minimum size of 400
+                
+                int centerX = (panelWidth - boardSize) / 2;
+                int centerY = (panelHeight - boardSize) / 2;
+
+                // Translate graphics to center the board
+                g2d.translate(centerX, centerY);
+
+                // Use GraphicsFactory to draw everything - responsive board size
+                GraphicsFactory.drawGameBoard(g2d, board, pieces,
+                        hoveredPieceWhite, hoveredPieceBlack,
+                        selectedPieceWhite, selectedPieceBlack,
+                        whiteInMovementMode, blackInMovementMode,
+                        whiteVisualX, whiteVisualY, blackVisualX, blackVisualY,
+                        whiteCursorX, whiteCursorY, blackCursorX, blackCursorY,
+                        boardSize, boardSize);
+
+                // Reset translation
+                g2d.translate(-centerX, -centerY);
+            }
+        };
+        gameBoardPanel.setOpaque(false); // Make transparent to show background
+
+        // Create left panel for black player moves - Responsive size
+        JPanel leftPanel = new JPanel(new BorderLayout()) {
+            @Override
+            public Dimension getPreferredSize() {
+                Container parent = getParent();
+                if (parent != null) {
+                    int parentWidth = parent.getWidth();
+                    int parentHeight = parent.getHeight();
+                    // Use 20% of screen width, minimum 200px
+                    int width = Math.max(200, (int)(parentWidth * 0.2));
+                    return new Dimension(width, parentHeight);
+                }
+                return new Dimension(250, 800); // fallback
+            }
+        };
+        leftPanel.setOpaque(false);
+
+        // Create custom titled border with enhanced gamer styling
+        TitledBorder blackBorder = new TitledBorder(new EmptyBorder(15, 15, 15, 15), "⚫ BLACK COMMANDER",
+                TitledBorder.CENTER, TitledBorder.TOP,
+                new Font("Orbitron", Font.BOLD, 16),
+                new Color(255, 100, 255));
+        leftPanel.setBorder(blackBorder);
+
+        JScrollPane blackScrollPane = new JScrollPane(moveTableListener.getBlackTable());
+        blackScrollPane.setOpaque(false);
+        blackScrollPane.getViewport().setOpaque(false);
+        blackScrollPane.setBorder(new EmptyBorder(8, 8, 8, 8));
+
+        // Enhanced table styling with transparent background
+        JTable blackTable = moveTableListener.getBlackTable();
+        blackTable.setOpaque(false);
+        blackTable.setShowGrid(true);
+        blackTable.setGridColor(new Color(255, 100, 255, 120));
+        blackTable.setForeground(new Color(255, 220, 255));
+        blackTable.setFont(new Font("Consolas", Font.BOLD, 13));
+        blackTable.setRowHeight(30); // Taller rows for better readability
+        blackTable.setIntercellSpacing(new Dimension(5, 3)); // Better cell spacing
+        blackTable.getTableHeader().setOpaque(false);
+        blackTable.getTableHeader().setBackground(new Color(0, 0, 0, 0)); // Fully transparent
+        blackTable.getTableHeader().setForeground(new Color(255, 150, 255));
+        blackTable.getTableHeader().setFont(new Font("Orbitron", Font.BOLD, 12));
+        blackTable.getTableHeader().setPreferredSize(new Dimension(0, 35)); // Taller header
+
+        leftPanel.add(blackScrollPane, BorderLayout.CENTER);
+
+        // Enhanced score label with glow effect
+        JLabel blackScore = moveTableListener.getBlackScoreLabel();
+        blackScore.setForeground(new Color(255, 120, 255));
+        blackScore.setFont(new Font("Orbitron", Font.BOLD, 18));
+        blackScore.setHorizontalAlignment(SwingConstants.CENTER);
+        blackScore.setBorder(new EmptyBorder(10, 0, 10, 0));
+        leftPanel.add(blackScore, BorderLayout.SOUTH);
+
+        // Create right panel for white player moves - Responsive size
+        JPanel rightPanel = new JPanel(new BorderLayout()) {
+            @Override
+            public Dimension getPreferredSize() {
+                Container parent = getParent();
+                if (parent != null) {
+                    int parentWidth = parent.getWidth();
+                    int parentHeight = parent.getHeight();
+                    // Use 20% of screen width, minimum 200px
+                    int width = Math.max(200, (int)(parentWidth * 0.2));
+                    return new Dimension(width, parentHeight);
+                }
+                return new Dimension(250, 800); // fallback
+            }
+        };
+        rightPanel.setOpaque(false);
+
+        // Create custom titled border with enhanced gamer styling
+        TitledBorder whiteBorder = new TitledBorder(new EmptyBorder(15, 15, 15, 15), "⚪ WHITE COMMANDER",
+                TitledBorder.CENTER, TitledBorder.TOP,
+                new Font("Orbitron", Font.BOLD, 16),
+                new Color(100, 255, 255));
+        rightPanel.setBorder(whiteBorder);
+
+        JScrollPane whiteScrollPane = new JScrollPane(moveTableListener.getWhiteTable());
+        whiteScrollPane.setOpaque(false);
+        whiteScrollPane.getViewport().setOpaque(false);
+        whiteScrollPane.setBorder(new EmptyBorder(8, 8, 8, 8));
+
+        // Enhanced table styling with transparent background
+        JTable whiteTable = moveTableListener.getWhiteTable();
+        whiteTable.setOpaque(false);
+        whiteTable.setShowGrid(true);
+        whiteTable.setGridColor(new Color(100, 255, 255, 120));
+        whiteTable.setForeground(new Color(220, 255, 255));
+        whiteTable.setFont(new Font("Consolas", Font.BOLD, 13));
+        whiteTable.setRowHeight(30); // Taller rows for better readability
+        whiteTable.setIntercellSpacing(new Dimension(5, 3)); // Better cell spacing
+        whiteTable.getTableHeader().setOpaque(false);
+        whiteTable.getTableHeader().setBackground(new Color(0, 0, 0, 0)); // Fully transparent
+        whiteTable.getTableHeader().setForeground(new Color(150, 255, 255));
+        whiteTable.getTableHeader().setFont(new Font("Orbitron", Font.BOLD, 12));
+        whiteTable.getTableHeader().setPreferredSize(new Dimension(0, 35)); // Taller header
+
+        rightPanel.add(whiteScrollPane, BorderLayout.CENTER);
+
+        // Enhanced score label with glow effect
+        JLabel whiteScore = moveTableListener.getWhiteScoreLabel();
+        whiteScore.setForeground(new Color(120, 255, 255));
+        whiteScore.setFont(new Font("Orbitron", Font.BOLD, 18));
+        whiteScore.setHorizontalAlignment(SwingConstants.CENTER);
+        whiteScore.setBorder(new EmptyBorder(10, 0, 10, 0));
+        rightPanel.add(whiteScore, BorderLayout.SOUTH);
+
+        // Add panels to main panel
+        mainPanel.add(leftPanel, BorderLayout.WEST);
+        mainPanel.add(gameBoardPanel, BorderLayout.CENTER);
+        mainPanel.add(rightPanel, BorderLayout.EAST);
+
+        this.frame.add(mainPanel);
+
+        // Add component listener to handle window resize
+        this.frame.addComponentListener(new java.awt.event.ComponentAdapter() {
+            @Override
+            public void componentResized(java.awt.event.ComponentEvent e) {
+                // Force repaint and revalidate when window is resized
+                SwingUtilities.invokeLater(() -> {
+                    mainPanel.revalidate();
+                    mainPanel.repaint();
+                });
+            }
+        });
+
+        // Load background image
+        loadBackgroundImage();
+
+        initializeGame();
+    }
+
+    /**
+     * Initialize the game by loading pieces and setting up the board
+     */
+    private void initializeGame() {
+        try {
+            // Use PieceFactory to create pieces with real configurations
+            loadPiecesFromBoardCsv();
+
+            logger.logCommand(Command.createGameControl("GAME_INITIALIZED"));
+
+            // Note: hover and selection initialization will be done in
+            // autoSelectFirstPieces()
+
+        } catch (Exception e) {
+            // Fall back to default pieces
+            pieces.putAll(pieceFactory.createDefaultPieces());
+        }
+    }
+
+    /**
+     * Load background image from resources
+     */
+    private void loadBackgroundImage() {
+        try {
+            InputStream is = getClass().getResourceAsStream("/background.png");
+            if (is == null) {
+                throw new IOException("Resource not found: /background.png");
+            }
+            backgroundImage = ImageIO.read(is);
+            System.out.println("Background image loaded successfully from resources.");
+        } catch (Exception e) {
+            System.out.println("Could not load background image: " + e.getMessage());
+            // Create a simple gradient background if image loading fails
+            backgroundImage = new java.awt.image.BufferedImage(1200, 1200, java.awt.image.BufferedImage.TYPE_INT_RGB);
+            java.awt.Graphics2D g2d = backgroundImage.createGraphics();
+
+            // Create a gradient from dark blue to light blue
+            java.awt.GradientPaint gradient = new java.awt.GradientPaint(
+                    0, 0, new java.awt.Color(30, 60, 120),
+                    1200, 1200, new java.awt.Color(100, 150, 200));
+            g2d.setPaint(gradient);
+            g2d.fillRect(0, 0, 1200, 1200);
+            g2d.dispose();
+
+            System.out.println("Created default gradient background");
+        }
+    }
+
+    /**
+     * Load pieces from board.csv using PieceFactory
+     */
+    private void loadPiecesFromBoardCsv() {
+        InputStream boardCsvStream = getClass().getClassLoader().getResourceAsStream("pieces/board.csv");
+    
+        if (boardCsvStream == null) {
+            pieces.putAll(pieceFactory.createDefaultPieces());
+            return;
+        }
+    
+        try {
+            pieces.putAll(pieceFactory.createPiecesFromBoardCsv());
+        } catch (Exception e) {
+            System.err.println("Error loading from board.csv: " + e.getMessage());
+            pieces.putAll(pieceFactory.createDefaultPieces());
+        }
+    }
+
+    /**
+     * Start the game loop
+     */
+    public void startGame() {
+        frame.setVisible(true);
+        running = true;
+        logger.logCommand(Command.createGameControl("GAME_STARTED"));
+
+        // Publish game started event
+        GameStartedEvent gameStartedEvent = new GameStartedEvent();
+        eventBus.publish(gameStartedEvent);
+
+        // Auto-select first piece for each player
+        autoSelectFirstPieces();
+
+        // Start game loop in separate thread
+        Thread gameLoop = new Thread(this::gameLoop);
+        gameLoop.setDaemon(true);
+        gameLoop.start();
+    }
+
+    /**
+     * Auto-select the first piece for each player and initialize cursor positions
+     */
+    private void autoSelectFirstPieces() {
+        // Initialize cursor positions: White at (7,7), Black at (0,0)
+        whiteCursorX = 7;
+        whiteCursorY = 7;
+        blackCursorX = 0;
+        blackCursorY = 0;
+
+        // Update hovered pieces based on cursor positions
+        hoveredPieceWhite = findPieceIdAt(whiteCursorX, whiteCursorY);
+        hoveredPieceBlack = findPieceIdAt(blackCursorX, blackCursorY);
+
+        System.out.println("Initialized white cursor at (7,7), hovering: " + 
+                          (hoveredPieceWhite != null ? hoveredPieceWhite : "empty square"));
+        System.out.println("Initialized black cursor at (0,0), hovering: " + 
+                          (hoveredPieceBlack != null ? hoveredPieceBlack : "empty square"));
+
+        // Don't auto-select pieces anymore - let players choose manually
+        selectedPieceWhite = null;
+        selectedPieceBlack = null;
+    }
+
+    /**
+     * Stop the game
+     */
+    public void stopGame() {
+        running = false;
+        logger.logCommand(Command.createGameControl("GAME_STOPPED"));
+        logger.saveLogs();
+        logger.printGameStats();
+    }
+
+    /**
+     * Main game loop
+     */
+    private void gameLoop() {
+        while (running) {
+            long currentTime = System.currentTimeMillis();
+            long deltaTime = currentTime - lastUpdateTime;
+
+            if (deltaTime >= UPDATE_INTERVAL_MS) {
+                update(deltaTime);
+                render();
+                lastUpdateTime = currentTime;
+            }
+
+            try {
+                Thread.sleep(1); // Prevent 100% CPU usage
+            } catch (InterruptedException e) {
+                break;
+            }
+        }
+    }
+
+    /**
+     * Update game state
+     */
+    private void update(long deltaTimeMs) {
+        // Update all piece states and animations
+        for (Piece piece : pieces.values()) {
+            State state = piece.getState();
+            if (state != null) {
+                state.update(); // Call without parameters for now
+            }
+        }
+
+        // Check for game end conditions
+        checkGameEndConditions();
+    }
+
+    /**
+     * Render current frame
+     */
+    private void render() {
+        // Just request a repaint of the frame
+        frame.repaint();
+    }
+
+    /**
+     * Check for game end conditions
+     */
+    private void checkGameEndConditions() {
+        // Check if any king is captured - look for pieces that start with "KW" or "KB"
+        boolean whiteKingExists = pieces.keySet().stream()
+                .anyMatch(key -> key.startsWith("KW"));
+        boolean blackKingExists = pieces.keySet().stream()
+                .anyMatch(key -> key.startsWith("KB"));
+
+        if (!whiteKingExists) {
+            endGame(Command.Player.BLACK, "Black wins - White king captured!");
+        } else if (!blackKingExists) {
+            endGame(Command.Player.WHITE, "White wins - Black king captured!");
+        }
+    }
+
+    /**
+     * End the game with a winner
+     */
+    private void endGame(Command.Player winner, String reason) {
+        running = false;
+        logger.logCommand(Command.createGameControl("GAME_ENDED: " + reason));
+        logger.saveLogs();
+
+        // Publish game ended event
+        GameEndedEvent gameEndedEvent = new GameEndedEvent(winner.toString());
+        eventBus.publish(gameEndedEvent);
+
+        // Display game over animation dialog
+        SwingUtilities.invokeLater(() -> {
+            JOptionPane.showMessageDialog(frame,
+                    reason + "\nWinner: " + winner,
+                    "Game Over",
+                    JOptionPane.INFORMATION_MESSAGE);
+        });
+    }
+
+    /**
+     * Raw KeyListener entry point: preserves existing logic before full migration
+     */
+    public void handleRawKeyPressed(KeyEvent e) {
+        int keyCode = e.getKeyCode();
+        // Track pressed keys for movement hold detection
+        pressedKeys.add(keyCode);
+
+        // Handle jump via Shift keys
+        if (keyCode == KeyEvent.VK_SHIFT) {
+            int loc = e.getKeyLocation();
+            if (loc == KeyEvent.KEY_LOCATION_LEFT && selectedPieceWhite != null) {
+                // Left Shift: white jump
+                executeCommand(Command.createJump(selectedPieceWhite, Command.Player.WHITE));
+            } else if (loc == KeyEvent.KEY_LOCATION_RIGHT && selectedPieceBlack != null) {
+                // Right Shift: black jump
+                executeCommand(Command.createJump(selectedPieceBlack, Command.Player.BLACK));
+            }
+            return;
+        }
+        // Handle special keys
+        switch (keyCode) {
+            case KeyEvent.VK_SPACE:
+                // White player: SPACE for piece selection or movement execution
+                if (!whiteInMovementMode) {
+                    // Try to select piece at current cursor position
+                    trySelectPieceAtCursor(Command.Player.WHITE);
+                    // If successful selection, enter movement mode
+                    if (selectedPieceWhite != null) {
+                        whiteInMovementMode = true;
+                        whitePendingDx = 0;
+                        whitePendingDy = 0;
+                        initializeVisualPosition(Command.Player.WHITE);
+                        System.out.println("White player entered movement mode with " + selectedPieceWhite);
+                    }
+                } else if (whiteInMovementMode) {
+                    // Execute accumulated move if exists
+                    if ((whitePendingDx != 0 || whitePendingDy != 0) && selectedPieceWhite != null) {
+                        // Create move command for validation and execution
+                        Command moveCommand = Command.createKeyInput("MOVE", Command.Player.WHITE);
+                        executeCommand(moveCommand);
+
+                        // Note: State will be managed by the animation in movePieceStepByStep
+                    }
+                    // Exit movement mode
+                    whiteInMovementMode = false;
+                    // Note: Don't reset visual position here - it should stay with the piece
+                    System.out.println("White player exited movement mode");
+                }
+                break;
+
+            case KeyEvent.VK_ENTER:
+                // Black player: ENTER for piece selection or movement execution
+                if (!blackInMovementMode) {
+                    // Try to select piece at current cursor position
+                    trySelectPieceAtCursor(Command.Player.BLACK);
+                    // If successful selection, enter movement mode
+                    if (selectedPieceBlack != null) {
+                        blackInMovementMode = true;
+                        blackPendingDx = 0;
+                        blackPendingDy = 0;
+                        initializeVisualPosition(Command.Player.BLACK);
+                        System.out.println("Black player entered movement mode with " + selectedPieceBlack);
+                    }
+                } else if (blackInMovementMode) {
+                    // Execute accumulated move if exists
+                    if ((blackPendingDx != 0 || blackPendingDy != 0) && selectedPieceBlack != null) {
+                        // Create move command for validation and execution
+                        Command moveCommand = Command.createKeyInput("MOVE", Command.Player.BLACK);
+                        executeCommand(moveCommand);
+
+                        // Note: State will be managed by the animation in movePieceStepByStep
+                    }
+                    // Exit movement mode
+                    blackInMovementMode = false;
+                    // Note: Don't reset visual position here - it should stay with the piece
+                    System.out.println("Black player exited movement mode");
+                }
+                break;
+            case KeyEvent.VK_ESCAPE:
+                // Exit movement modes
+                whiteInMovementMode = false;
+                blackInMovementMode = false;
+                // Don't reset visual positions - they should stay with the selected pieces
+                // Only clear selections to remove borders
+                selectedPieceWhite = null;
+                selectedPieceBlack = null;
+                whiteVisualX = -1; // Now reset visual positions since no selection
+                whiteVisualY = -1;
+                blackVisualX = -1;
+                blackVisualY = -1;
+                Command command = Command.createGameControl("END_GAME");
+                executeCommand(command);
+                break;
+
+            // WHITE PLAYER Controls (WASD) - Always allow cursor movement
+            case KeyEvent.VK_W:
+                if (!whiteInMovementMode) {
+                    selectPieceWithDirection(Command.Player.WHITE, "UP");
+                } else {
+                    // Always allow cursor movement - no validation here
+                    whitePendingDy--;
+                    updateVisualPosition(Command.Player.WHITE);
+                    frame.repaint(); // Immediate visual feedback
+                    System.out.println("White player pending move: dx=" + whitePendingDx + ", dy=" + whitePendingDy);
+                }
+                break;
+            case KeyEvent.VK_S:
+                if (!whiteInMovementMode) {
+                    selectPieceWithDirection(Command.Player.WHITE, "DOWN");
+                } else {
+                    // Always allow cursor movement - no validation here
+                    whitePendingDy++;
+                    updateVisualPosition(Command.Player.WHITE);
+                    frame.repaint(); // Immediate visual feedback
+                    System.out.println("White player pending move: dx=" + whitePendingDx + ", dy=" + whitePendingDy);
+                }
+                break;
+            case KeyEvent.VK_A:
+                if (!whiteInMovementMode) {
+                    selectPieceWithDirection(Command.Player.WHITE, "LEFT");
+                } else {
+                    // Always allow cursor movement - no validation here
+                    whitePendingDx--;
+                    updateVisualPosition(Command.Player.WHITE);
+                    frame.repaint(); // Immediate visual feedback
+                    System.out.println("White player pending move: dx=" + whitePendingDx + ", dy=" + whitePendingDy);
+                }
+                break;
+            case KeyEvent.VK_D:
+                if (!whiteInMovementMode) {
+                    selectPieceWithDirection(Command.Player.WHITE, "RIGHT");
+                } else {
+                    // Always allow cursor movement - no validation here
+                    whitePendingDx++;
+                    updateVisualPosition(Command.Player.WHITE);
+                    frame.repaint(); // Immediate visual feedback
+                    System.out.println("White player pending move: dx=" + whitePendingDx + ", dy=" + whitePendingDy);
+                }
+                break;
+
+            // BLACK PLAYER Controls (Arrow Keys) - Always allow cursor movement
+            case KeyEvent.VK_UP:
+                if (!blackInMovementMode) {
+                    selectPieceWithDirection(Command.Player.BLACK, "UP");
+                } else {
+                    // Always allow cursor movement - no validation here
+                    blackPendingDy--;
+                    updateVisualPosition(Command.Player.BLACK);
+                    frame.repaint(); // Immediate visual feedback
+                    System.out.println("Black player pending move: dx=" + blackPendingDx + ", dy=" + blackPendingDy);
+                }
+                break;
+            case KeyEvent.VK_DOWN:
+                if (!blackInMovementMode) {
+                    selectPieceWithDirection(Command.Player.BLACK, "DOWN");
+                } else {
+                    // Always allow cursor movement - no validation here
+                    blackPendingDy++;
+                    updateVisualPosition(Command.Player.BLACK);
+                    frame.repaint(); // Immediate visual feedback
+                    System.out.println("Black player pending move: dx=" + blackPendingDx + ", dy=" + blackPendingDy);
+                }
+                break;
+            case KeyEvent.VK_LEFT:
+                if (!blackInMovementMode) {
+                    selectPieceWithDirection(Command.Player.BLACK, "LEFT");
+                } else {
+                    // Always allow cursor movement - no validation here
+                    blackPendingDx--;
+                    updateVisualPosition(Command.Player.BLACK);
+                    frame.repaint(); // Immediate visual feedback
+                    System.out.println("Black player pending move: dx=" + blackPendingDx + ", dy=" + blackPendingDy);
+                }
+                break;
+            case KeyEvent.VK_RIGHT:
+                if (!blackInMovementMode) {
+                    selectPieceWithDirection(Command.Player.BLACK, "RIGHT");
+                } else {
+                    // Always allow cursor movement - no validation here
+                    blackPendingDx++;
+                    updateVisualPosition(Command.Player.BLACK);
+                    frame.repaint(); // Immediate visual feedback
+                    System.out.println("Black player pending move: dx=" + blackPendingDx + ", dy=" + blackPendingDy);
+                }
+                break;
+        }
+
+        // Handle hover keys using Command utility methods
+        if (Command.isWhiteHoverKey(keyCode)) {
+            String direction = Command.getHoverDirection(keyCode);
+            hoverPieceWithDirection(Command.Player.WHITE, direction);
+        } else if (Command.isBlackHoverKey(keyCode)) {
+            String direction = Command.getHoverDirection(keyCode);
+            hoverPieceWithDirection(Command.Player.BLACK, direction);
+        }
+
+        // Continue with remaining cases
+        switch (keyCode) {
+            // Hover to Selection conversion
+            case KeyEvent.VK_C:
+                // White player: Convert current hover to selection
+                if (hoveredPieceWhite != null) {
+                    if (pieces.get(hoveredPieceWhite).isWhite()) {
+                        selectedPieceWhite = hoveredPieceWhite;
+                        // Initialize visual position for selection border
+                        initializeVisualPosition(Command.Player.WHITE);
+                        frame.repaint(); // Force repaint to show selection
+                        System.out.println("White selected from hover: " + selectedPieceWhite);
+                        Command selectCommand = Command.createGameControl("SELECT_FROM_HOVER:" + selectedPieceWhite);
+                        logger.logCommand(selectCommand);
+                    } else {
+                        System.out.println("*** SELECTION REJECTED: White player cannot select black piece " + hoveredPieceWhite + " ***");
+                    }
+                }
+                break;
+            case KeyEvent.VK_V:
+                // Black player: Convert current hover to selection
+                if (hoveredPieceBlack != null) {
+                    if (!pieces.get(hoveredPieceBlack).isWhite()) {
+                        selectedPieceBlack = hoveredPieceBlack;
+                        // Initialize visual position for selection border
+                        initializeVisualPosition(Command.Player.BLACK);
+                        frame.repaint(); // Force repaint to show selection
+                        System.out.println("Black selected from hover: " + selectedPieceBlack);
+                        Command selectCommand = Command.createGameControl("SELECT_FROM_HOVER:" + selectedPieceBlack);
+                        logger.logCommand(selectCommand);
+                    } else {
+                        System.out.println("*** SELECTION REJECTED: Black player cannot select white piece " + hoveredPieceBlack + " ***");
+                    }
+                }
+                break;
+            case KeyEvent.VK_M:
+                // Legacy key for black player selection (keeping for compatibility)
+                if (hoveredPieceBlack != null) {
+                    if (!pieces.get(hoveredPieceBlack).isWhite()) {
+                        selectedPieceBlack = hoveredPieceBlack;
+                        System.out.println("Black selected from hover: " + selectedPieceBlack);
+                        Command selectCommand = Command.createGameControl("SELECT_FROM_HOVER:" + selectedPieceBlack);
+                        logger.logCommand(selectCommand);
+                    } else {
+                        System.out.println("*** SELECTION REJECTED: Black player cannot select white piece " + hoveredPieceBlack + " ***");
+                    }
+                }
+                break;
+        }
+
+        // Handle number keys for piece selection using Command utility methods
+        if (Command.isNumberKey(keyCode)) {
+            int pieceIndex = Command.numberKeyToIndex(keyCode);
+            Command.Player player = e.isShiftDown() ? Command.Player.BLACK : Command.Player.WHITE;
+            selectPieceByNumber(pieceIndex, player);
+        }
+    }
+
+    /**
+     * Temporary delegate for InputHandler compatibility
+     */
+    public void keyPressed(KeyEvent e) {
+        handleRawKeyPressed(e);
+    }
+
+    /**
+     * Execute a command through the command system
+     */
+    private void executeCommand(Command command) {
+        if (command == null)
+            return;
+
+        // Log the command
+        logger.logCommand(command);
+
+        // Process the command based on its type
+        switch (command.getCommandType()) {
+            case GAME_CONTROL:
+                handleGameControlCommand(command);
+                break;
+            case KEY_INPUT:
+                handleMovementCommand(command);
+                break;
+            case MOVE:
+                handleMoveCommand(command);
+                break;
+            case JUMP:
+                handleJumpCommand(command);
+                break;
+            default:
+        }
+    }
+
+    /**
+     * Public entry to process commands from external executors
+     */
+    public void processCommand(Command command) {
+        executeCommand(command);
+    }
+
+    /**
+     * Handle movement commands (WASD/arrows) - Move the selected piece step by step
+     */
+    private void handleMovementCommand(Command command) {
+        // Get selected piece by player
+        Command.Player player = command.getPlayer();
+        Piece piece = (player == Command.Player.WHITE)
+                ? pieces.get(selectedPieceWhite)
+                : pieces.get(selectedPieceBlack);
+
+        if (piece == null) {
+            System.out.println("No piece selected for " + player + " - move not executed");
+            return;
+        }
+
+        if (!piece.getState().canPerformAction()) {
+            System.out.println("Piece " + piece.getId() + " cannot perform action due to state - move not executed");
+            return;
+        }
+
+        // Use accumulated movement values
+        int dx = (player == Command.Player.WHITE) ? whitePendingDx : blackPendingDx;
+        int dy = (player == Command.Player.WHITE) ? whitePendingDy : blackPendingDy;
+
+        // Check if there's any pending movement
+        if (dx == 0 && dy == 0) {
+            System.out.println("No pending movement for " + player + " - move not executed");
+            return;
+        }
+
+        System.out.println("Attempting to execute move for " + player + ": dx=" + dx + ", dy=" + dy);
+
+        // Try to move the piece step by step - validation happens inside movePieceStepByStep
+        movePieceStepByStep(piece, dx, dy);
+
+        // Force repaint to see the change immediately
+        frame.repaint();
+    }
+
+    /**
+     * Handle move commands
+     */
+    private void handleMoveCommand(Command command) {
+        // This would handle more complex moves like chess notation
+    }
+
+    /**
+     * Handle jump commands: move piece by pending deltas, capture if landing on
+     * enemy
+     */
+    private void handleJumpCommand(Command command) {
+        String pieceId = command.getPieceId();
+        if (!pieces.containsKey(pieceId))
+            return;
+        Piece piece = pieces.get(pieceId);
+
+        // Publish sound event for jump FIRST - always play sound regardless of outcome
+        SoundEvent jumpSound = new SoundEvent(SoundEvent.SoundType.JUMP);
+        System.out.println("DEBUG: Publishing JUMP sound event");
+        eventBus.publish(jumpSound);
+
+        // Determine pending jump deltas and reset
+        int dx = (command.getPlayer() == Command.Player.WHITE) ? whitePendingDx : blackPendingDx;
+        int dy = (command.getPlayer() == Command.Player.WHITE) ? whitePendingDy : blackPendingDy;
+        if (command.getPlayer() == Command.Player.WHITE) {
+            whitePendingDx = 0;
+            whitePendingDy = 0;
+        } else {
+            blackPendingDx = 0;
+            blackPendingDy = 0;
+        }
+        // Calculate landing position
+        double currentX = piece.getX();
+        double currentY = piece.getY();
+        double nextX = currentX + dx;
+        double nextY = currentY + dy;
+
+        // Check for enemy at landing
+        Piece target = findPieceAt(nextX, nextY);
+        if (target != null && target.isWhite() != piece.isWhite()) {
+            handleCollision(piece, target);
+        } else {
+            // Move piece to landing (no capture)
+            piece.setPosition(nextX, nextY);
+
+            // Check for pawn promotion after jump
+            if (shouldPromotePawn(piece, nextY)) {
+                promotePawnToQueen(pieceId, piece);
+                return; // Exit early since piece was replaced
+            }
+
+            // Publish jump event without capture
+            publishMoveEvent(piece, currentX, currentY, nextX, nextY, null);
+        }
+
+        // Set jump state
+        piece.getState().setState(State.PieceState.JUMP);
+        System.out.println("Piece " + pieceId + " jumped to (" + nextX + "," + nextY + ")");
+    }
+
+    /**
+     * Move cursor for a player using direction keys (board-based navigation)
+     */
+    private void selectPieceWithDirection(Command.Player player, String direction) {
+        // Get current cursor position
+        int currentX = (player == Command.Player.WHITE) ? whiteCursorX : blackCursorX;
+        int currentY = (player == Command.Player.WHITE) ? whiteCursorY : blackCursorY;
+
+        // Calculate new cursor position based on direction
+        int newX = currentX;
+        int newY = currentY;
+
+        switch (direction) {
+            case "UP":
+                newY = Math.max(0, currentY - 1);
+                break;
+            case "DOWN":
+                newY = Math.min(board.getHeightCells() - 1, currentY + 1);
+                break;
+            case "LEFT":
+                newX = Math.max(0, currentX - 1);
+                break;
+            case "RIGHT":
+                newX = Math.min(board.getWidthCells() - 1, currentX + 1);
+                break;
+        }
+
+        // Update cursor position
+        if (player == Command.Player.WHITE) {
+            whiteCursorX = newX;
+            whiteCursorY = newY;
+            System.out.println("White cursor moved to (" + newX + "," + newY + ")");
+        } else {
+            blackCursorX = newX;
+            blackCursorY = newY;
+            System.out.println("Black cursor moved to (" + newX + "," + newY + ")");
+        }
+
+        // Update hovered piece (if any exists at this position)
+        String pieceIdAtPosition = findPieceIdAt(newX, newY);
+        if (player == Command.Player.WHITE) {
+            hoveredPieceWhite = pieceIdAtPosition;
+            if (pieceIdAtPosition != null) {
+                System.out.println("White cursor hovering over: " + pieceIdAtPosition);
+            } else {
+                System.out.println("White cursor on empty square");
+            }
+        } else {
+            hoveredPieceBlack = pieceIdAtPosition;
+            if (pieceIdAtPosition != null) {
+                System.out.println("Black cursor hovering over: " + pieceIdAtPosition);
+            } else {
+                System.out.println("Black cursor on empty square");
+            }
+        }
+    }
+
+    /**
+     * Try to select piece at current cursor position
+     */
+    private void trySelectPieceAtCursor(Command.Player player) {
+        // Get current cursor position
+        int cursorX = (player == Command.Player.WHITE) ? whiteCursorX : blackCursorX;
+        int cursorY = (player == Command.Player.WHITE) ? whiteCursorY : blackCursorY;
+
+        // Find piece at cursor position
+        String pieceIdAtCursor = findPieceIdAt(cursorX, cursorY);
+
+        if (pieceIdAtCursor == null) {
+            System.out.println("*** SELECTION REJECTED: No piece at cursor position (" + cursorX + "," + cursorY + ") ***");
+            return;
+        }
+
+        // Check if piece belongs to the player
+        Piece piece = pieces.get(pieceIdAtCursor);
+        boolean isPieceValid = (player == Command.Player.WHITE && piece.isWhite()) ||
+                (player == Command.Player.BLACK && !piece.isWhite());
+
+        if (!isPieceValid) {
+            String playerColor = (player == Command.Player.WHITE) ? "White" : "Black";
+            String pieceColor = piece.isWhite() ? "white" : "black";
+            System.out.println("*** SELECTION REJECTED: " + playerColor + " player cannot select " + pieceColor + " piece " + pieceIdAtCursor + " ***");
+            return;
+        }
+
+        // Valid selection - update selected piece
+        if (player == Command.Player.WHITE) {
+            selectedPieceWhite = pieceIdAtCursor;
+            // Initialize visual position to match actual piece position
+            initializeVisualPosition(Command.Player.WHITE);
+            System.out.println("White selected piece: " + selectedPieceWhite + " at (" + cursorX + "," + cursorY + ")");
+        } else {
+            selectedPieceBlack = pieceIdAtCursor;
+            // Initialize visual position to match actual piece position
+            initializeVisualPosition(Command.Player.BLACK);
+            System.out.println("Black selected piece: " + selectedPieceBlack + " at (" + cursorX + "," + cursorY + ")");
+        }
+
+        // Force repaint to show selection immediately
+        frame.repaint();
+
+        // Log the selection
+        Command selectCommand = Command.createGameControl("SELECT_PIECE:" + pieceIdAtCursor);
+        logger.logCommand(selectCommand);
+    }
+
+    /**
+     * Move hover between pieces without selecting
+     */
+    private void hoverPieceWithDirection(Command.Player player, String direction) {
+        // Ensure we only get pieces of the appropriate color
+        List<String> playerPieces = Command.getPlayerPieces(player, pieces);
+        if (playerPieces.isEmpty())
+            return;
+
+        String currentHovered = (player == Command.Player.WHITE) ? hoveredPieceWhite : hoveredPieceBlack;
+        int currentIndex = playerPieces.indexOf(currentHovered);
+
+        // If no piece hovered or piece not found, start from beginning
+        if (currentIndex == -1) {
+            currentIndex = 0;
+        } else {
+            // Cycle through pieces based on direction
+            switch (direction) {
+                case "UP":
+                case "LEFT":
+                    currentIndex = (currentIndex - 1 + playerPieces.size()) % playerPieces.size();
+                    break;
+                case "DOWN":
+                case "RIGHT":
+                    currentIndex = (currentIndex + 1) % playerPieces.size();
+                    break;
+            }
+        }
+
+        String newHoveredPiece = playerPieces.get(currentIndex);
+
+        // Double-check the piece color matches the player before hovering
+        boolean pieceColorMatches = (player == Command.Player.WHITE && newHoveredPiece.contains("W")) ||
+                (player == Command.Player.BLACK && newHoveredPiece.contains("B"));
+
+        if (!pieceColorMatches) {
+            System.out.println("ERROR: Attempted to hover over piece of wrong color: " + newHoveredPiece);
+            return;
+        }
+
+        if (player == Command.Player.WHITE) {
+            hoveredPieceWhite = newHoveredPiece;
+            System.out.println("*** WHITE HOVER CHANGED TO: " + hoveredPieceWhite + " ***");
+        } else {
+            hoveredPieceBlack = newHoveredPiece;
+            System.out.println("*** BLACK HOVER CHANGED TO: " + hoveredPieceBlack + " ***");
+        }
+    }
+
+    /**
+     * Move a piece step by step based on user input
+     */
+    private void movePieceStepByStep(Piece piece, int dx, int dy) {
+        double currentX = piece.getX();
+        double currentY = piece.getY();
+
+        // Calculate the next position
+        double nextX = currentX + dx;
+        double nextY = currentY + dy;
+
+        System.out.println("DEBUG: Current position: (" + currentX + "," + currentY + ")");
+        System.out.println("DEBUG: Next position: (" + nextX + "," + nextY + ")");
+        System.out.println("DEBUG: Requested move: (" + dx + "," + dy + ")");
+
+        // Check if this move is allowed by the piece's moves.txt file
+        if (!isValidMoveForPiece(piece, dx, dy)) {
+            System.out.println("*** MOVE REJECTED: " + piece.getId() + " cannot move (" + dx + "," + dy + ") - not allowed by piece movement rules! ***");
+            return;
+        }
+
+        // Check board boundaries
+        if (nextX < 0 || nextX >= board.getWidthCells() ||
+                nextY < 0 || nextY >= board.getHeightCells()) {
+            System.out.println("*** MOVE REJECTED: " + piece.getId() + " cannot move to (" + nextX + "," + nextY + ") - out of bounds! ***");
+            return;
+        }
+
+        // Check path blocking (knights can jump over pieces)
+        if (!isKnight(piece) && isPathBlocked(piece.getX(), piece.getY(), nextX, nextY)) {
+            System.out.println("*** MOVE REJECTED: " + piece.getId() + " cannot move to (" + nextX + "," + nextY + ") - path is blocked! ***");
+            return;
+        }
+
+        // Check for collisions with other pieces
+        Piece collidingPiece = findPieceAt(nextX, nextY);
+        if (collidingPiece != null && !collidingPiece.equals(piece)) {
+            System.out.println("DEBUG: Collision detected with " + collidingPiece.getId());
+
+            // Check if this is a valid capture (different colors)
+            if (piece.isWhite() != collidingPiece.isWhite()) {
+                System.out.println("DEBUG: Valid capture! " + piece.getId() + " can capture " + collidingPiece.getId());
+                handleCollision(piece, collidingPiece);
+                
+                // Update visual position after capture
+                updateVisualPositionAfterMove(piece, nextX, nextY);
+                
+                System.out.println("DEBUG: Capture completed!");
+            } else {
+                System.out.println("*** MOVE REJECTED: " + piece.getId() + " cannot capture " + collidingPiece.getId() + " - same color! ***");
+                return;
+            }
+        } else {
+            // No collision - animated move
+            // Set piece to MOVE state for animation
+            piece.getState().setState(State.PieceState.MOVE);
+
+            // Publish sound event for move
+            SoundEvent moveSound = new SoundEvent(SoundEvent.SoundType.MOVE);
+            System.out.println("DEBUG: Publishing MOVE sound event");
+            eventBus.publish(moveSound);
+
+            // Publish move event for regular move (no capture)
+            publishMoveEvent(piece, currentX, currentY, nextX, nextY, null);
+
+            // Create animation thread
+            new Thread(() -> {
+                try {
+                    double progress = 0;
+                    while (progress < 1.0) {
+                        // Calculate interpolated position
+                        double interpX = piece.getX() + (nextX - piece.getX()) * progress;
+                        double interpY = piece.getY() + (nextY - piece.getY()) * progress;
+                        piece.setPosition(interpX, interpY);
+
+                        // Update progress
+                        progress += 0.05; // Slower progress for smoother, slower animation
+                        Thread.sleep(100); // Slower animation timing
+
+                        // Request repaint
+                        frame.repaint();
+                    }
+
+                    // Ensure final position is exact
+                    piece.setPosition(nextX, nextY);
+
+                    // Update visual position to match the new piece position
+                    updateVisualPositionAfterMove(piece, nextX, nextY);
+
+                    // Check for pawn promotion after move
+                    if (shouldPromotePawn(piece, nextY)) {
+                        String movingKey = getPieceIdFromPiece(piece);
+                        promotePawnToQueen(movingKey, piece);
+                        return; // Exit early since piece was replaced
+                    }
+
+                    // Set back to REST state
+                    piece.getState().setState(State.PieceState.REST);
+
+                    // Final repaint
+                    frame.repaint();
+
+                } catch (InterruptedException e) {
+                    // Handle interruption if needed
+                    piece.setPosition(nextX, nextY);
+
+                    // Update visual position even if interrupted
+                    updateVisualPositionAfterMove(piece, nextX, nextY);
+
+                    // Check for pawn promotion even if interrupted
+                    if (shouldPromotePawn(piece, nextY)) {
+                        String movingKey = getPieceIdFromPiece(piece);
+                        promotePawnToQueen(movingKey, piece);
+                        return; // Exit early since piece was replaced
+                    }
+
+                    piece.getState().setState(State.PieceState.REST);
+                    frame.repaint();
+                }
+            }).start();
+
+            System.out.println("DEBUG: Piece " + piece.getId() + " moving to (" + nextX + "," + nextY + ")");
+        }
+
+        // No need for immediate repaint here as animation thread handles it
+    }
+
+    /**
+     * Convert board coordinates to chess notation (e.g., 0,0 -> a1, 1,0 -> b1)
+     */
+    private String coordinatesToChessNotation(double x, double y) {
+        char file = (char) ('a' + (int) x);
+        int rank = (int) (8 - y); // Chess ranks are numbered 1-8 from bottom to top
+        return "" + file + rank;
+    }
+
+    /**
+     * Get piece type character from piece ID
+     */
+    private String getPieceTypeFromId(String pieceId) {
+        if (pieceId == null || pieceId.length() == 0)
+            return "?";
+        return pieceId.substring(0, 1); // First character is piece type
+    }
+
+    /**
+     * Get player from piece ID
+     */
+    private String getPlayerFromId(String pieceId) {
+        if (pieceId == null || pieceId.length() < 2)
+            return "UNKNOWN";
+        return pieceId.contains("W") ? "WHITE" : "BLACK";
+    }
+
+    /**
+     * Publish a move event to the event bus
+     */
+    private void publishMoveEvent(Piece piece, double fromX, double fromY, double toX, double toY,
+            String capturedPiece) {
+        String pieceId = getPieceIdFromPiece(piece);
+        String fromNotation = coordinatesToChessNotation(fromX, fromY);
+        String toNotation = coordinatesToChessNotation(toX, toY);
+        String player = getPlayerFromId(pieceId);
+        String pieceType = getPieceTypeFromId(pieceId);
+
+        moveCounter++;
+
+        PieceMovedEvent event = new PieceMovedEvent(
+                fromNotation,
+                toNotation,
+                player,
+                pieceType,
+                moveCounter,
+                capturedPiece);
+
+        eventBus.publish(event);
+    }
+
+    /**
+     * Get piece ID from piece object
+     */
+    private String getPieceIdFromPiece(Piece piece) {
+        for (Map.Entry<String, Piece> entry : pieces.entrySet()) {
+            if (entry.getValue() == piece) {
+                return entry.getKey();
+            }
+        }
+        return piece.getId(); // fallback
+    }
+
+    /**
+     * Check if a move is valid for a piece based on its moves.txt file
+     */
+    private boolean isValidMoveForPiece(Piece piece, int dx, int dy) {
+        // Get the piece's moves from its state
+        State state = piece.getState();
+        if (state == null || state.getMoves() == null) {
+            System.out.println("DEBUG: No moves defined for piece " + piece.getId() + ", allowing all moves");
+            return true; // If no moves defined, allow all moves
+        }
+
+        Moves moves = state.getMoves();
+        List<String> movesList = moves.getAllowedMoves();
+
+        if (movesList == null || movesList.isEmpty()) {
+            System.out.println("DEBUG: Empty moves list for piece " + piece.getId() + ", allowing all moves");
+            return true; // If moves list is empty, allow all moves
+        }
+
+        System.out.println("DEBUG: Checking moves for piece " + piece.getId() + ": " + movesList);
+
+        // Check if the requested move matches any of the allowed moves
+        for (String moveStr : movesList) {
+            if (moveStr.trim().isEmpty())
+                continue;
+
+            try {
+                // Parse move string (format: "dx,dy")
+                String[] parts = moveStr.split(",");
+                if (parts.length >= 2) {
+                    int allowedDx = Integer.parseInt(parts[0].trim());
+                    int allowedDy = Integer.parseInt(parts[1].trim());
+
+                    // Check if this move matches the requested move
+                    if (allowedDx == dx && allowedDy == dy) {
+                        System.out.println("DEBUG: Move (" + dx + "," + dy + ") is allowed for " + piece.getId());
+                        return true;
+                    }
+
+                    // Also check negative direction (for bidirectional moves)
+                    if (allowedDx == -dx && allowedDy == -dy) {
+                        System.out.println("DEBUG: Move (" + dx + "," + dy + ") is allowed (reverse direction) for "
+                                + piece.getId());
+                        return true;
+                    }
+                }
+            } catch (NumberFormatException e) {
+                System.out.println("DEBUG: Invalid move format in moves.txt: " + moveStr);
+            }
+        }
+
+        System.out.println("DEBUG: Move (" + dx + "," + dy + ") is NOT allowed for " + piece.getId());
+        System.out.println("DEBUG: Available moves: " + movesList);
+
+        // Temporary fallback - allow basic moves for common pieces
+        String pieceType = piece.getId().substring(0, 1);
+        System.out.println("DEBUG: Piece type: " + pieceType + ", trying fallback moves");
+
+        switch (pieceType) {
+            case "P": // Pawn
+                // Check if it's a forward move (dy = 1 for black, dy = -1 for white)
+                boolean isWhitePawn = piece.getId().contains("W");
+                int forwardDirection = isWhitePawn ? -1 : 1; // White moves up (-y), Black moves down (+y)
+
+                // Allow diagonal captures
+                if (Math.abs(dx) == 1 && dy == forwardDirection) {
+                    // Only allow diagonal moves if there's an enemy piece to capture
+                    double nextX = piece.getX() + dx;
+                    double nextY = piece.getY() + dy;
+                    Piece targetPiece = findPieceAt(nextX, nextY);
+                    if (targetPiece != null && targetPiece.isWhite() != piece.isWhite()) {
+                        System.out.println("DEBUG: Allowing pawn capture move");
+                        return true;
+                    }
+                    return false;
+                }
+
+                // Allow forward moves
+                if (dx == 0) {
+                    // Check if this is the pawn's first move
+                    boolean isStartingPosition = (isWhitePawn && piece.getY() == 6)
+                            || (!isWhitePawn && piece.getY() == 1);
+
+                    // One square forward is always allowed
+                    if (dy == forwardDirection) {
+                        System.out.println("DEBUG: Allowing regular pawn move");
+                        return true;
+                    }
+
+                    // Two squares forward only on first move
+                    if (isStartingPosition && dy == (forwardDirection * 2)) {
+                        System.out.println("DEBUG: Allowing pawn's initial two-square move");
+                        return true;
+                    }
+                }
+                break;
+            case "R": // Rook
+                if ((dx == 0 && Math.abs(dy) == 1) || (Math.abs(dx) == 1 && dy == 0)) {
+                    System.out.println("DEBUG: Allowing rook move as fallback");
+                    return true;
+                }
+                break;
+            case "N": // Knight
+                if ((Math.abs(dx) == 2 && Math.abs(dy) == 1) || (Math.abs(dx) == 1 && Math.abs(dy) == 2)) {
+                    System.out.println("DEBUG: Allowing knight move as fallback");
+                    return true;
+                }
+                break;
+            case "B": // Bishop
+                if (Math.abs(dx) == 1 && Math.abs(dy) == 1) {
+                    System.out.println("DEBUG: Allowing bishop move as fallback");
+                    return true;
+                }
+                break;
+            case "Q": // Queen
+            case "K": // King
+                if ((Math.abs(dx) <= 1 && Math.abs(dy) <= 1) && !(dx == 0 && dy == 0)) {
+                    System.out.println("DEBUG: Allowing queen/king move as fallback");
+                    return true;
+                }
+                break;
+        }
+
+        return false;
+    }
+
+    /**
+     * Check if a piece is a knight (can jump over other pieces)
+     */
+    private boolean isKnight(Piece piece) {
+        return piece.getId().startsWith("N");
+    }
+
+    /**
+     * Check if the path between two positions is blocked by other pieces
+     * Knights are exempt from this check as they can jump
+     */
+    private boolean isPathBlocked(double fromX, double fromY, double toX, double toY) {
+        // Calculate direction
+        int deltaX = (int)(toX - fromX);
+        int deltaY = (int)(toY - fromY);
+        
+        // For single-step moves, no path checking needed
+        if (Math.abs(deltaX) <= 1 && Math.abs(deltaY) <= 1) {
+            return false;
+        }
+        
+        // Calculate step direction
+        int stepX = deltaX == 0 ? 0 : (deltaX > 0 ? 1 : -1);
+        int stepY = deltaY == 0 ? 0 : (deltaY > 0 ? 1 : -1);
+        
+        // Check each square in the path (excluding start and end positions)
+        double checkX = fromX + stepX;
+        double checkY = fromY + stepY;
+        
+        while (checkX != toX || checkY != toY) {
+            // Check if there's a piece at this position
+            Piece blockingPiece = findPieceAt(checkX, checkY);
+            if (blockingPiece != null) {
+                System.out.println("DEBUG: Path blocked by " + blockingPiece.getId() + " at (" + checkX + "," + checkY + ")");
+                return true;
+            }
+            
+            // Move to next square in path
+            checkX += stepX;
+            checkY += stepY;
+        }
+        
+        return false; // Path is clear
+    }
+
+    /**
+     * Handle collision between two pieces
+     */
+    private void handleCollision(Piece movingPiece, Piece targetPiece) {
+        // Check if it's a capture (different players)
+        if (movingPiece.isWhite() != targetPiece.isWhite()) {
+            // Store original positions for event
+            double fromX = movingPiece.getX();
+            double fromY = movingPiece.getY();
+            double toX = targetPiece.getX();
+            double toY = targetPiece.getY();
+
+            // Find map keys for moving and target pieces
+            String movingKey = null;
+            String targetKey = null;
+            for (Map.Entry<String, Piece> e : pieces.entrySet()) {
+                if (e.getValue() == movingPiece)
+                    movingKey = e.getKey();
+                if (e.getValue() == targetPiece)
+                    targetKey = e.getKey();
+            }
+
+            // Get captured piece type for event
+            String capturedPieceType = getPieceTypeFromId(targetKey);
+
+            // Remove the captured piece
+            if (targetKey != null) {
+                pieces.remove(targetKey);
+                if (DEBUG)
+                    System.out.println("DEBUG: Removed captured piece " + targetKey);
+            }
+
+            // Move attacking piece to target position
+            movingPiece.setPosition(targetPiece.getX(), targetPiece.getY());
+            if (DEBUG)
+                System.out.println("DEBUG: Moved piece " + movingKey + " to position " + targetPiece.getX() + ","
+                        + targetPiece.getY());
+
+            // Check for pawn promotion after capture
+            if (shouldPromotePawn(movingPiece, targetPiece.getY())) {
+                promotePawnToQueen(movingKey, movingPiece);
+                return; // Exit early since piece was replaced
+            }
+
+            // Publish sound event for eat
+            SoundEvent eatSound = new SoundEvent(SoundEvent.SoundType.EAT);
+            System.out.println("DEBUG: Publishing EAT sound event");
+            eventBus.publish(eatSound);
+
+            // Publish move event with capture information
+            publishMoveEvent(movingPiece, fromX, fromY, toX, toY, capturedPieceType);
+
+            // Log capture using full keys
+            Command.Player capturer = movingPiece.isWhite() ? Command.Player.WHITE : Command.Player.BLACK;
+            String logKey = movingKey != null ? movingKey : movingPiece.getId();
+            String logCaptured = targetKey != null ? targetKey : targetPiece.getId();
+            Command captureCommand = Command.createMove(
+                    logKey,
+                    movingPiece.getX(),
+                    movingPiece.getY(),
+                    capturer);
+            logger.logCapture(capturer, logCaptured, captureCommand);
+
+            // Set piece to rest state after capture (like after regular move)
+            movingPiece.getState().setState(State.PieceState.REST);
+
+            System.out.println(String.format("%s captured %s!", logKey, logCaptured));
+
+            // Check if game ended due to king capture
+            checkGameEndConditions();
+        }
+    }
+
+    /**
+     * Find piece at specific coordinates
+     */
+    private Piece findPieceAt(double x, double y) {
+        double tolerance = 0.1; // Small tolerance
+
+        for (Piece piece : pieces.values()) {
+            double distance = Math.sqrt(
+                    Math.pow(piece.getX() - x, 2) +
+                            Math.pow(piece.getY() - y, 2));
+            if (distance <= tolerance) {
+                return piece;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Find piece ID at specific coordinates
+     */
+    private String findPieceIdAt(double x, double y) {
+        double tolerance = 0.1; // Small tolerance
+
+        for (Map.Entry<String, Piece> entry : pieces.entrySet()) {
+            Piece piece = entry.getValue();
+            double distance = Math.sqrt(
+                    Math.pow(piece.getX() - x, 2) +
+                            Math.pow(piece.getY() - y, 2));
+            if (distance <= tolerance) {
+                return entry.getKey();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Check if a pawn should be promoted to queen
+     */
+    private boolean shouldPromotePawn(Piece piece, double newY) {
+        String pieceId = getPieceIdFromPiece(piece);
+        if (!pieceId.startsWith("P"))
+            return false; // Only pawns can be promoted
+
+        boolean isWhite = piece.isWhite();
+        return (isWhite && newY == 0) || (!isWhite && newY == 7);
+    }
+
+    /**
+     * Promote a pawn to queen
+     */
+    private void promotePawnToQueen(String pawnKey, Piece pawn) {
+        try {
+            // Create new queen at pawn's position
+            String queenId = pawn.isWhite() ? "QW" : "QB";
+            Piece newQueen = pieceFactory.createPiece(queenId, (int) pawn.getX(), (int) pawn.getY());
+
+            if (newQueen != null) {
+                // Remove the pawn from pieces map
+                pieces.remove(pawnKey);
+
+                // Add the new queen with a unique key
+                String newQueenKey = queenId + "_promoted_" + System.currentTimeMillis();
+                pieces.put(newQueenKey, newQueen);
+
+                // Update selected piece if this was the selected pawn
+                if (pawnKey.equals(selectedPieceWhite)) {
+                    selectedPieceWhite = newQueenKey;
+                }
+                if (pawnKey.equals(selectedPieceBlack)) {
+                    selectedPieceBlack = newQueenKey;
+                }
+
+                // Update hovered piece if this was the hovered pawn
+                if (pawnKey.equals(hoveredPieceWhite)) {
+                    hoveredPieceWhite = newQueenKey;
+                }
+                if (pawnKey.equals(hoveredPieceBlack)) {
+                    hoveredPieceBlack = newQueenKey;
+                }
+
+                System.out.println("PAWN PROMOTION: " + pawnKey + " promoted to " + newQueenKey + " at (" + pawn.getX()
+                        + "," + pawn.getY() + ")");
+
+                // Force repaint to show the new queen
+                frame.repaint();
+            } else {
+                System.err.println("ERROR: Failed to create queen for promotion of " + pawnKey);
+            }
+        } catch (Exception e) {
+            System.err.println("ERROR: Exception during pawn promotion: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * Select piece by number for a specific player (0-7 for player's pieces)
+     */
+    private void selectPieceByNumber(int index, Command.Player player) {
+        java.util.List<String> playerPieces = pieces.keySet().stream()
+                .filter(id -> {
+                    return (player == Command.Player.WHITE && id.contains("W")) ||
+                            (player == Command.Player.BLACK && id.contains("B"));
+                })
+                .sorted()
+                .collect(java.util.stream.Collectors.toList());
+
+        if (index < playerPieces.size()) {
+            selectPiece(playerPieces.get(index), player);
+        }
+    }
+
+    /**
+     * Select a piece by ID for a specific player
+     */
+    public void selectPiece(String pieceId, Command.Player player) {
+        if (pieces.containsKey(pieceId)) {
+            Piece piece = pieces.get(pieceId);
+
+            // Check if piece belongs to the player
+            boolean isPieceValid = (player == Command.Player.WHITE && pieceId.contains("W")) ||
+                    (player == Command.Player.BLACK && pieceId.contains("B"));
+
+            if (isPieceValid) {
+                if (player == Command.Player.WHITE) {
+                    selectedPieceWhite = pieceId;
+                } else {
+                    selectedPieceBlack = pieceId;
+                }
+
+                piece.getState().setState(State.PieceState.IDLE);
+                Command selectCommand = Command.createGameControl("SELECT_PIECE:" + pieceId);
+                logger.logCommand(selectCommand);
+                System.out.println(player + " selected piece: " + pieceId);
+            } else {
+                System.out.println(player + " cannot select opponent's piece: " + pieceId);
+            }
+        }
+    }
+
+    /**
+     * Handle game control commands
+     */
+    private void handleGameControlCommand(Command command) {
+        String controlType = command.getKeyInput(); // For game control commands, we use keyInput field
+
+        if (controlType.equals("END_GAME")) {
+            stopGame();
+        }
+        // Add other game control handling...
+    }
+
+    public void keyReleased(KeyEvent e) {
+        pressedKeys.remove(e.getKeyCode());
+        // Don't automatically set pieces to REST - let the player decide when to stop
+        // moving
+    }
+
+    public void keyTyped(KeyEvent e) {
+        // Not used
+    }
+
+    public Board getBoard() {
+        return board;
+    }
+
+    public org.kamatech.chess.Graphics getGraphics() {
+        return graphics;
+    }
+
+    public Physics getPhysics() {
+        return physics;
+    }
+
+    public GameLogger getLogger() {
+        return logger;
+    }
+
+    public Map<String, Piece> getPieces() {
+        return new HashMap<>(pieces);
+    }
+
+    public boolean isRunning() {
+        return running;
+    }
+
+    public String getSelectedPieceWhite() {
+        return selectedPieceWhite;
+    }
+
+    public String getSelectedPieceBlack() {
+        return selectedPieceBlack;
+    }
+
+    public String getHoveredPieceWhite() {
+        return hoveredPieceWhite;
+    }
+
+    public String getHoveredPieceBlack() {
+        return hoveredPieceBlack;
+    }
+
+    @Override
+    public Game clone() {
+        Game cloned = new Game(board.clone(), pieceFactory, graphicsFactory, physicsFactory);
+        for (Map.Entry<String, Piece> entry : pieces.entrySet()) {
+            cloned.pieces.put(entry.getKey(), entry.getValue().clone());
+        }
+        return cloned;
+    }
+
+    public static void main(String[] args) {
+        SwingUtilities.invokeLater(() -> {
+            try {
+                // Create initial board image
+                Img boardImg = new Img();
+                URL boardPath = Game.class.getClassLoader().getResource("board.png");
+                if (boardPath == null) {
+                    throw new RuntimeException("board.png file not found in resources directory");
+                }
+                try {
+                    boardImg.read(boardPath.getPath(), new Dimension(800, 800), true, null);
+                } catch (Exception e) {
+                    System.out.println("Could not load board from project root, creating default board");
+                    // Create a simple colored board if image loading fails
+                    java.awt.image.BufferedImage defaultBoard = new java.awt.image.BufferedImage(800, 800,
+                            java.awt.image.BufferedImage.TYPE_INT_RGB);
+                    java.awt.Graphics2D g2d = defaultBoard.createGraphics();
+                    g2d.setColor(Color.LIGHT_GRAY);
+                    g2d.fillRect(0, 0, 800, 800);
+
+                    // Draw chess board pattern
+                    for (int row = 0; row < 8; row++) {
+                        for (int col = 0; col < 8; col++) {
+                            if ((row + col) % 2 == 1) {
+                                g2d.setColor(Color.DARK_GRAY);
+                                g2d.fillRect(col * 100, row * 100, 100, 100);
+                            }
+                        }
+                    }
+                    g2d.dispose();
+
+                    // Set the default board image
+                    boardImg.setImage(defaultBoard);
+                }
+
+                // Create board with standard chess dimensions (8x8)
+                Board board = new Board(
+                        100, // cellHeightPixels
+                        100, // cellWidthPixels
+                        1, // cellHeightMeters
+                        1, // cellWidthMeters
+                        8, // widthCells (standard chess board)
+                        8, // heightCells (standard chess board)
+                        boardImg);
+
+                // Create factories
+                GraphicsFactory graphicsFactory = new GraphicsFactory();
+                PhysicsFactory physicsFactory = new PhysicsFactory();
+                PieceFactory pieceFactory = new PieceFactory(graphicsFactory, physicsFactory);
+
+                // Create and start game
+                Game game = new Game(board, pieceFactory, graphicsFactory, physicsFactory);
+                game.startGame();
+
+            } catch (Exception e) {
+                e.printStackTrace();
+                JOptionPane.showMessageDialog(null,
+                        "Error starting game: " + e.getMessage(),
+                        "Error",
+                        JOptionPane.ERROR_MESSAGE);
+            }
+        });
+    }
+    
+    /**
+     * Get the game frame for dialog positioning
+     */
+    public javax.swing.JFrame getFrame() {
+        return frame;
+    }
+}
